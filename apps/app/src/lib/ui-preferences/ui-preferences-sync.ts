@@ -137,6 +137,7 @@ function reconcileUiPreference<Key extends UiPreferenceKey>(
   const state = getSyncState(key);
   if (state.pending !== null || state.inFlight !== null) return;
   const entry = response.preferences[key];
+  if (entry === undefined) return;
   if (entry.revision === 0 && !state.migrationAttempted) {
     state.migrationAttempted = true;
     const legacy = readLegacyLocalUiPreference(key);
@@ -174,12 +175,34 @@ export function scheduleUiPreferenceWrite<Key extends UiPreferenceKey>(
   if (state.inFlight === null) void flushUiPreference(key);
 }
 
-async function readCurrentUiPreferences(
+function getUiPreferenceEntry<Key extends UiPreferenceKey>(
+  response: UiPreferencesResponse,
+  key: Key,
+): UiPreferenceEntry<Key> | undefined {
+  return response.preferences[key];
+}
+
+function requireUiPreferenceEntry<Key extends UiPreferenceKey>(
+  response: UiPreferencesResponse,
+  key: Key,
+): UiPreferenceEntry<Key> {
+  const entry = getUiPreferenceEntry(response, key);
+  if (entry === undefined) {
+    throw new Error(`UI preference '${key}' is unavailable on this server.`);
+  }
+  return entry;
+}
+
+async function readCurrentUiPreference<Key extends UiPreferenceKey>(
   queryClient: QueryClient,
-): Promise<UiPreferencesResponse> {
+  key: Key,
+): Promise<UiPreferenceEntry<Key>> {
   const cached = getCachedUiPreferences(queryClient);
-  if (cached !== undefined) return cached;
-  return refetchUiPreferences(queryClient);
+  if (cached !== undefined) {
+    const entry = getUiPreferenceEntry(cached, key);
+    if (entry !== undefined) return entry;
+  }
+  return requireUiPreferenceEntry(await refetchUiPreferences(queryClient), key);
 }
 
 async function refetchUiPreferences(
@@ -200,9 +223,11 @@ function recordServerEntry<Key extends UiPreferenceKey>(
   entry: UiPreferenceEntry<Key>,
 ): void {
   const cached = getCachedUiPreferences(queryClient);
+  const cachedEntry =
+    cached === undefined ? undefined : getUiPreferenceEntry(cached, key);
   if (
     cached === undefined ||
-    cached.preferences[key].revision >= entry.revision
+    (cachedEntry !== undefined && cachedEntry.revision >= entry.revision)
   ) {
     return;
   }
@@ -216,7 +241,7 @@ async function writeUiPreference<Key extends UiPreferenceKey>(
   key: Key,
   operations: readonly PreferenceOperation<Key>[],
 ): Promise<void> {
-  let base = (await readCurrentUiPreferences(queryClient)).preferences[key];
+  let base = await readCurrentUiPreference(queryClient, key);
   for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt++) {
     const applicable =
       base.revision === 0
@@ -238,7 +263,10 @@ async function writeUiPreference<Key extends UiPreferenceKey>(
     } catch (error) {
       if (!isUiPreferenceConflict(error)) throw error;
     }
-    base = (await refetchUiPreferences(queryClient)).preferences[key];
+    base = requireUiPreferenceEntry(
+      await refetchUiPreferences(queryClient),
+      key,
+    );
   }
 }
 

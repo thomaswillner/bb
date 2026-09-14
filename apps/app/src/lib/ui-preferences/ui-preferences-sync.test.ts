@@ -127,6 +127,19 @@ describe("ui preferences sync", () => {
     expect(mocks.set).not.toHaveBeenCalled();
   });
 
+  it("keeps local state when an older response omits a registered preference", () => {
+    const { modeAtom, queryClient, store } = createHarness();
+    store.set(modeAtom, "machine");
+    startUiPreferencesSync({ queryClient, store });
+    const response = serverResponse();
+    Reflect.deleteProperty(
+      response.preferences,
+      "sidebar.organizationMode",
+    );
+    expect(() => reconcileUiPreferences(response)).not.toThrow();
+    expect(store.get(modeAtom)).toBe("machine");
+  });
+
   it("uploads a legacy browser value once when the server has no revision yet", async () => {
     window.localStorage.setItem(
       "bb.sidebar.organizationMode",
@@ -197,6 +210,38 @@ describe("ui preferences sync", () => {
     expect(mocks.list).not.toHaveBeenCalled();
   });
 
+  it("records a completed write when its cached entry disappears in flight", async () => {
+    const { modeAtom, queryClient, store } = createHarness();
+    startUiPreferencesSync({ queryClient, store });
+    setCachedUiPreferences(
+      queryClient,
+      serverResponse({
+        "sidebar.organizationMode": { revision: 3, value: "project" },
+      }),
+    );
+    let finishWrite!: () => void;
+    mocks.set.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishWrite = () =>
+            resolve({ revision: 4, value: "machine" });
+        }),
+    );
+    store.set(modeAtom, "machine");
+    await vi.waitFor(() => expect(mocks.set).toHaveBeenCalledTimes(1));
+    const changed = serverResponse();
+    Reflect.deleteProperty(changed.preferences, "sidebar.organizationMode");
+    setCachedUiPreferences(queryClient, changed);
+    finishWrite();
+    await waitForUiPreferenceWrites();
+    expect(
+      getCachedUiPreferences(queryClient)?.preferences[
+        "sidebar.organizationMode"
+      ],
+    ).toEqual({ revision: 4, value: "machine" });
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
   it("fetches the current revision when nothing is cached", async () => {
     const { modeAtom, queryClient, store } = createHarness();
     startUiPreferencesSync({ queryClient, store });
@@ -213,6 +258,50 @@ describe("ui preferences sync", () => {
       key: "sidebar.organizationMode",
       value: "machine",
     });
+  });
+
+  it("refetches when the cached response omits the preference being written", async () => {
+    const { modeAtom, queryClient, store } = createHarness();
+    startUiPreferencesSync({ queryClient, store });
+    const cached = serverResponse();
+    Reflect.deleteProperty(cached.preferences, "sidebar.organizationMode");
+    setCachedUiPreferences(queryClient, cached);
+    mocks.list.mockResolvedValueOnce(
+      serverResponse({
+        "sidebar.organizationMode": { revision: 5, value: "project" },
+      }),
+    );
+    store.set(modeAtom, "machine");
+    await waitForUiPreferenceWrites();
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+    expect(mocks.set).toHaveBeenCalledWith({
+      expectedRevision: 5,
+      key: "sidebar.organizationMode",
+      value: "machine",
+    });
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("keeps a write local when a refreshed response still omits its preference", async () => {
+    const { modeAtom, queryClient, store } = createHarness();
+    startUiPreferencesSync({ queryClient, store });
+    const cached = serverResponse();
+    Reflect.deleteProperty(cached.preferences, "sidebar.organizationMode");
+    setCachedUiPreferences(queryClient, cached);
+    const refreshed = serverResponse();
+    Reflect.deleteProperty(refreshed.preferences, "sidebar.organizationMode");
+    mocks.list.mockResolvedValueOnce(refreshed);
+    store.set(modeAtom, "machine");
+    await waitForUiPreferenceWrites();
+    expect(store.get(modeAtom)).toBe("machine");
+    expect(mocks.set).not.toHaveBeenCalled();
+    expect(mocks.toastError).toHaveBeenCalledWith(
+      "Couldn’t sync sidebar preferences",
+      expect.objectContaining({
+        description:
+          "UI preference 'sidebar.organizationMode' is unavailable on this server.",
+      }),
+    );
   });
 
   it("re-applies a functional update on top of the server value after a conflict", async () => {
