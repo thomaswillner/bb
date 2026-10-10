@@ -1259,10 +1259,116 @@ describe("acp bridge", () => {
     });
   });
 
-  it("falls back to the synthetic model when the list command prints no models", async () => {
-    const emptyId = sendModelList({ modelLines: "no model lines here" });
-    expect((await waitForResponse(emptyId)).result).toMatchObject({
-      models: [{ id: "acp-default", isDefault: true }],
+  it.each([
+    ["exits unsuccessfully", "process.exit(2)"],
+    ["prints no models", "process.stdout.write('no model lines here')"],
+    ["times out", "setInterval(() => {}, 1000)"],
+    ["is killed by a signal", "process.kill(process.pid, 'SIGKILL')"],
+    [
+      "exceeds the output buffer",
+      "process.stdout.write('kept-model - Kept Model\\n' + 'x'.repeat(2 * 1024 * 1024))",
+    ],
+  ])(
+    "fails model/list when the configured command %s without a cached catalog",
+    async (_failure, script) => {
+      const failingId = sendModelList({
+        agent: { command: process.execPath, args: ["-e", script] },
+        modelListArgs: ["--"],
+      });
+      const response = await waitFor(
+        () => findResponse(failingId),
+        `response ${failingId}`,
+        70_000,
+      );
+      expect(response.error?.message).toBe(
+        "ACP model list command failed to provide a model catalog.",
+      );
+      expect(response.result).toBeUndefined();
+    },
+    75_000,
+  );
+
+  it("keeps the last good CLI catalog when the same command later fails", async () => {
+    const scriptPath = join(workspaceDir, "model-list.cjs");
+    writeFileSync(
+      scriptPath,
+      "process.stdout.write('cached-model - Cached Model\\n')",
+    );
+    const launch = {
+      agent: { command: process.execPath, args: [scriptPath] },
+      modelListArgs: ["--"],
+    };
+    const first = await waitForResponse(sendModelList(launch));
+    expect(first.result).toMatchObject({
+      models: [{ id: "cached-model", displayName: "Cached Model" }],
+    });
+
+    writeFileSync(scriptPath, "process.exit(2)");
+    const second = await waitForResponse(sendModelList(launch));
+    expect(second.error).toBeUndefined();
+    expect(second.result).toEqual(first.result);
+  });
+
+  it("does not serve another command's cached catalog when the command changes", async () => {
+    const scriptPath = join(workspaceDir, "model-list-keyed.cjs");
+    writeFileSync(
+      scriptPath,
+      "process.stdout.write('keyed-model - Keyed Model\\n')",
+    );
+    const first = await waitForResponse(
+      sendModelList({
+        agent: { command: process.execPath, args: [scriptPath] },
+        modelListArgs: ["--"],
+      }),
+    );
+    expect(first.result).toMatchObject({ models: [{ id: "keyed-model" }] });
+
+    writeFileSync(scriptPath, "process.exit(2)");
+    const changed = await waitForResponse(
+      sendModelList({
+        agent: { command: process.execPath, args: [scriptPath] },
+        modelListArgs: ["--", "--changed-flag"],
+      }),
+    );
+    expect(changed.error?.message).toBe(
+      "ACP model list command failed to provide a model catalog.",
+    );
+    expect(changed.result).toBeUndefined();
+  });
+
+  it("returns a listed acp-default line as a real catalog, not the synthetic fallback", async () => {
+    const scriptPath = join(workspaceDir, "model-list-default.cjs");
+    writeFileSync(
+      scriptPath,
+      "process.stdout.write('acp-default - Listed Default\\n')",
+    );
+    const response = await waitForResponse(
+      sendModelList({
+        agent: { command: process.execPath, args: [scriptPath] },
+        modelListArgs: ["--"],
+      }),
+    );
+    expect(response.error).toBeUndefined();
+    expect(response.result).toMatchObject({
+      models: [{ id: "acp-default", displayName: "Listed Default" }],
+    });
+  });
+
+  it("returns a legitimate single-entry catalog as a result, not an error", async () => {
+    const scriptPath = join(workspaceDir, "model-list-single.cjs");
+    writeFileSync(
+      scriptPath,
+      "process.stdout.write('only-model - Only Model\\n')",
+    );
+    const response = await waitForResponse(
+      sendModelList({
+        agent: { command: process.execPath, args: [scriptPath] },
+        modelListArgs: ["--"],
+      }),
+    );
+    expect(response.error).toBeUndefined();
+    expect(response.result).toMatchObject({
+      models: [{ id: "only-model", displayName: "Only Model" }],
     });
   });
 
